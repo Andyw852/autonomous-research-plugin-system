@@ -1,0 +1,23 @@
+{
+  "launched_at": "2026-01-01T00:00:00+00:00",
+  "summary": {"total": 2, "succeeded": 1, "failed": 0, "running": 1, "pending": 0},
+  "done": false,
+  "jobs": {
+    "task-1": {
+      "status": "succeeded",
+      "exit_code": 0,
+      "wall_seconds": 123.4,
+      "stdout": "logs/task-1.stdout",
+      "stderr": "logs/task-1.stderr",
+      "updated_at": "2026-01-01T00:05:00+00:00"
+    },
+    "task-2": {
+      "status": "running",
+      "exit_code": null,
+      "wall_seconds": null,
+      "stdout": "logs/task-2.stdout",
+      "stderr": "logs/task-2.stderr",
+      "updated_at": "2026-01-01T00:03:00+00:00"
+    }
+  }
+}

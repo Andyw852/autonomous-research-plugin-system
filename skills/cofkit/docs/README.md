@@ -1,0 +1,35 @@
+# Documentation
+
+Use this directory as the canonical documentation set for `cofkit`.
+
+## User Workflows
+
+- [Cross-platform bilingual Jupyter tutorials](../tutorials/README.md): English and Chinese Bash/PowerShell notebooks with commented Python API equivalents
+- [Getting started](getting-started.md): repository setup, verification, first build, CLI shape
+- [Building COFs](building.md): single-pair generation, batch generation, all binary bridges, default library rebuilds, topology and stacking options
+- [Analysis and validation](analysis-validation.md): output classification, CIF-to-COFid decomposition, COFid validation, Zeo++ pore analysis
+- [Event decomposition](event-decomposition.md): default event/hypothesis architecture, diagnostics, limitations, legacy compatibility, and benchmark results
+- [Decomposition visual atlas](decomposition-visual.html): illustrated event-to-hypothesis CIF decomposition flow, per-linkage chemistry, global validation, conflict resolution, and topology recovery
+- [Calculations](calculations.md): LAMMPS optimization, EQeq charge staging, gRASPA/RASPA2 Widom/isotherm/mixture workflows, hybrid MD/MC
+- [Python API](python-api.md): practical `COFEngine` and `BatchStructureGenerator` examples
+- [External tools](external-tools.md): recommended Zeo++, LAMMPS, EQeq, gRASPA, and RASPA2 installs
+- [External tools environment](external-tools-environment.md): current machine availability, executable paths, and environment variables
+- [Intent routing](intent-routing.md): map natural-language cofkit requests to concrete CLI/Python workflows, output artifacts, and common traps
+- [Troubleshooting](troubleshooting.md): common runtime issues such as gRASPA CUDA device errors and their fixes
+- [Minimal end-to-end example](../examples/minimum/README.md): COF build → Zeo++ → LAMMPS+EQeq → gRASPA H2 isotherm
+
+## Reference
+
+- [CURRENT_SCOPE.md](CURRENT_SCOPE.md): implemented capabilities and current limitations
+- [KNOWN_ISSUES.md](KNOWN_ISSUES.md): tracked technical issues from the 2026-08-17 engineering audit, by severity, with fix directions
+- [TECHNICAL_OVERVIEW.md](TECHNICAL_OVERVIEW.md): design notes, topology repository details, and pipeline structure
+- [COARSE_VALIDATION.md](COARSE_VALIDATION.md): validation buckets and current thresholds
+- [COFid_Specification_v1.2.md](COFid_Specification_v1.2.md): COFid format reference
+- [WRAPPER_SCRIPTS.md](WRAPPER_SCRIPTS.md): legacy notes for the thin scripts under `examples/`
+- [zeopp-capability-map.md](zeopp-capability-map.md): discovered Zeo++ command/data surface and practical stability notes
+- [adding-linkages-and-monomers.md](adding-linkages-and-monomers.md): checklist for extending cofkit reaction chemistry
+
+## Related
+
+- [../ARCHITECTURE.md](../ARCHITECTURE.md): broader architecture notes
+- [../CHANGELOG.md](../CHANGELOG.md): release history

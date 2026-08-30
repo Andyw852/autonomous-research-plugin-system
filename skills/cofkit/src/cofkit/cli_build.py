@@ -1,0 +1,1109 @@
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Iterable
+
+from .batch import BatchGenerationConfig, BatchStructureGenerator
+from .build_workflows.ring_forming import RingFormationConfig, RingFormingStructureGenerator
+from .chem.rdkit import build_rdkit_monomer
+from .cif import CIFWriter
+from .cofid import cofid_to_build_request, try_generate_cofid
+from .lammps import LammpsOptimizationSettings
+from .monomer_library import MonomerRoleResolver
+from .reactions import ReactionLibrary
+
+
+def _default_repo_path(*parts: str) -> str:
+    """Resolve a built-in default path for CLI arguments.
+
+    In a source checkout, the bundled ``examples/`` and generated ``out/``
+    directories live at the repository root (two levels above this file).
+    For an installed package there is no repository root; fall back to
+    paths relative to the current working directory instead of pointing
+    inside the Python installation.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    if (repo_root / "pyproject.toml").is_file() and (repo_root / "src" / "cofkit").is_dir():
+        return str(repo_root.joinpath(*parts))
+    return str(Path(*parts))
+
+
+def add_build_group(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "build",
+        help="Build COF structures and build-time inputs.",
+        description="Build COF structures, inspect build-capable templates, and generate detector-scanned monomer libraries.",
+    )
+    _set_help_default(parser)
+
+    build_subparsers = parser.add_subparsers(dest="build_command")
+    _add_single_pair_parser(build_subparsers)
+    _add_ring_forming_parser(build_subparsers)
+    _add_batch_binary_bridge_parser(build_subparsers)
+    _add_batch_all_binary_bridges_parser(build_subparsers)
+    _add_default_library_parser(build_subparsers)
+    _add_list_templates_parser(build_subparsers)
+
+
+def _set_help_default(parser: argparse.ArgumentParser) -> None:
+    def _show_help(_: argparse.Namespace) -> None:
+        parser.print_help()
+
+    parser.set_defaults(func=_show_help)
+
+
+def _add_common_batch_generation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--target-dimensionality",
+        choices=("2D", "3D"),
+        default="2D",
+        help="Target dimensionality for topology selection. Defaults to 2D.",
+    )
+    parser.add_argument("--input-dir", required=False, help="Directory containing monomer libraries.")
+    parser.add_argument("--output-dir", required=False, help="Directory for manifests, summaries, and CIF exports.")
+    parser.add_argument("--max-pairs", type=int, default=None, help="Optional cap on attempted pairings.")
+    parser.add_argument(
+        "--write-cif",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write CIF files for generated structures. Enabled by default; pass --no-write-cif to disable.",
+    )
+    parser.add_argument(
+        "--max-cif-exports",
+        type=int,
+        default=None,
+        help="Optional maximum number of CIF files to export.",
+    )
+    parser.add_argument(
+        "--num-conformers",
+        type=int,
+        default=4,
+        help="Number of RDKit conformers to sample per monomer during batch construction.",
+    )
+    parser.add_argument(
+        "--all-topologies",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enumerate all applicable topologies per monomer pair. Enabled by default.",
+    )
+    parser.add_argument(
+        "--topology",
+        action="append",
+        default=[],
+        help="Explicit topology id to evaluate. Repeat to request multiple indexed topologies.",
+    )
+    parser.add_argument(
+        "--use-indexed-topology-defaults",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Augment legacy defaults with indexed two-monomer topology discovery for compatible pairs.",
+    )
+    parser.add_argument(
+        "--stacking",
+        action="append",
+        default=[],
+        help=(
+            "Enumerate one named stacking registry for eligible 2D outputs. "
+            "Repeat for multiple registries, for example --stacking AA --stacking AB."
+        ),
+    )
+    parser.add_argument(
+        "--auto-detect-libraries",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Infer monomer role and connectivity from SMILES instead of relying on role/count filename prefixes.",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Worker budget for pair generation. Defaults to 8.",
+    )
+    parser.add_argument(
+        "--legacy-scoring",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Attach the deprecated event-count heuristic score to outputs and rank candidates by it. "
+            "Disabled by default: outputs carry score=null and candidates are ranked by mean "
+            "bridge-geometry residual."
+        ),
+    )
+    _add_geometry_repair_arguments(parser)
+
+
+def _add_geometry_repair_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--repair-geometry",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run the LAMMPS soft-minimization repair pass for graph-intact structures classified as "
+            "needs_optimization. Disabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--repair-lmp-path",
+        default=None,
+        help="Optional explicit LAMMPS executable for --repair-geometry. Defaults to COFKIT_LMP_PATH.",
+    )
+    parser.add_argument(
+        "--repair-timeout-seconds",
+        type=float,
+        default=300.0,
+        help="Timeout per LAMMPS geometry-repair run. Default: 300.",
+    )
+
+
+def _configure_generator(args: argparse.Namespace, *, template_id: str | None = None) -> BatchStructureGenerator:
+    effective_template_id = template_id or getattr(args, "template_id", None) or "imine_bridge"
+    allowed_reactions = (effective_template_id,)
+    return BatchStructureGenerator(
+        BatchGenerationConfig(
+            allowed_reactions=allowed_reactions,
+            target_dimensionality=args.target_dimensionality,
+            topology_ids=tuple(args.topology),
+            use_indexed_topology_defaults=args.use_indexed_topology_defaults,
+            stacking_ids=tuple(args.stacking),
+            rdkit_num_conformers=args.num_conformers,
+            enumerate_all_topologies=args.all_topologies,
+            post_build_conversions=tuple(getattr(args, "annotate_post_build_conversion", ())),
+            write_cif=args.write_cif,
+            max_cif_exports=args.max_cif_exports,
+            max_workers=args.max_workers,
+            repair_geometry=args.repair_geometry,
+            repair_geometry_lmp_path=args.repair_lmp_path,
+            repair_geometry_timeout_seconds=args.repair_timeout_seconds,
+            enable_legacy_scoring=getattr(args, "legacy_scoring", False),
+            repair_geometry_settings=LammpsOptimizationSettings(
+                forcefield="dreiding",
+                charge_model="none",
+                pre_minimization_mode="soft",
+                relax_cell=True,
+            ),
+        )
+    )
+
+
+def _add_single_pair_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "single-pair",
+        help="Generate one COF candidate set from two monomers.",
+        description="Generate one single-pair COF candidate set from two monomers using an explicit or autodetected binary-bridge template.",
+    )
+    parser.add_argument("--cofid", default=None, help="COFid string to build from. When supplied, it defines the monomers, topology, and linkage.")
+    parser.add_argument("--template-id", default="imine_bridge", help="Binary bridge template to use.")
+    parser.add_argument("--first-smiles", default=None, help="SMILES for the first monomer.")
+    parser.add_argument("--second-smiles", default=None, help="SMILES for the second monomer.")
+    parser.add_argument("--first-id", default="monomer_a", help="Identifier for the first monomer.")
+    parser.add_argument("--second-id", default="monomer_b", help="Identifier for the second monomer.")
+    parser.add_argument("--first-name", default=None, help="Display name for the first monomer.")
+    parser.add_argument("--second-name", default=None, help="Display name for the second monomer.")
+    parser.add_argument("--first-motif-kind", default=None, help="Explicit motif kind for the first monomer.")
+    parser.add_argument("--second-motif-kind", default=None, help="Explicit motif kind for the second monomer.")
+    parser.add_argument(
+        "--auto-detect-motifs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Infer motif kinds from SMILES when explicit motif kinds are not provided. Enabled by default.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=_default_repo_path("out", "single_pair_generation"),
+        help="Directory for the single-pair summary and CIF outputs.",
+    )
+    parser.add_argument(
+        "--write-cif",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write CIF files for generated structures. Enabled by default; pass --no-write-cif to disable.",
+    )
+    parser.add_argument(
+        "--num-conformers",
+        type=int,
+        default=4,
+        help="Number of RDKit conformers to sample per monomer during monomer construction.",
+    )
+    parser.add_argument(
+        "--all-topologies",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enumerate all applicable topologies per monomer pair. Enabled by default.",
+    )
+    parser.add_argument(
+        "--topology",
+        action="append",
+        default=[],
+        help="Explicit topology id to evaluate. Repeat to request multiple indexed topologies.",
+    )
+    parser.add_argument(
+        "--use-indexed-topology-defaults",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Augment legacy defaults with indexed two-monomer topology discovery for compatible pairs.",
+    )
+    parser.add_argument(
+        "--stacking",
+        action="append",
+        default=[],
+        help=(
+            "Enumerate one named stacking registry for eligible 2D outputs. "
+            "Repeat for multiple registries, for example --stacking AA --stacking AB."
+        ),
+    )
+    parser.add_argument(
+        "--target-dimensionality",
+        choices=("2D", "3D"),
+        default="2D",
+        help="Target dimensionality for topology selection. Defaults to 2D.",
+    )
+    parser.add_argument(
+        "--max-cif-exports",
+        type=int,
+        default=None,
+        help="Optional maximum number of CIF files to export. Defaults to no limit.",
+    )
+    parser.add_argument("--max-workers", type=int, default=1, help="Worker budget. Defaults to 1 for single-pair mode.")
+    parser.add_argument(
+        "--legacy-scoring",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Attach the deprecated event-count heuristic score to outputs and rank candidates by it. "
+            "Disabled by default: outputs carry score=null and candidates are ranked by mean "
+            "bridge-geometry residual."
+        ),
+    )
+    _add_geometry_repair_arguments(parser)
+    parser.set_defaults(func=_run_single_pair)
+
+
+def _run_single_pair(args: argparse.Namespace) -> None:
+    if args.cofid is not None and (
+        args.first_smiles is not None
+        or args.second_smiles is not None
+        or args.first_motif_kind is not None
+        or args.second_motif_kind is not None
+        or args.topology
+    ):
+        raise SystemExit(
+            "--cofid cannot be combined with --first-smiles/--second-smiles, "
+            "--first-motif-kind/--second-motif-kind, or --topology"
+        )
+
+    requested_cofid = None
+    if args.cofid is not None:
+        request = cofid_to_build_request(args.cofid)
+        args = argparse.Namespace(**vars(args))
+        requested_cofid = request.cofid
+        args.template_id = request.template_id
+        args.first_smiles = request.monomers[0].canonical_smiles
+        args.second_smiles = request.monomers[1].canonical_smiles
+        args.first_motif_kind = request.monomers[0].motif_kind
+        args.second_motif_kind = request.monomers[1].motif_kind
+        args.target_dimensionality = request.target_dimensionality
+        args.topology = [request.topology]
+        args.all_topologies = False
+        if args.first_id == "monomer_a":
+            args.first_id = "cofid_m1"
+        if args.second_id == "monomer_b":
+            args.second_id = "cofid_m2"
+        if args.first_name is None:
+            args.first_name = args.first_id
+        if args.second_name is None:
+            args.second_name = args.second_id
+    elif args.first_smiles is None or args.second_smiles is None:
+        raise SystemExit("single-pair requires either --cofid or both --first-smiles and --second-smiles")
+
+    library = ReactionLibrary.builtin()
+    profile = library.linkage_profile(args.template_id)
+    if profile is None or not profile.supports_binary_bridge_pair_generation:
+        raise SystemExit(f"template {args.template_id!r} does not support current single-pair binary-bridge generation")
+
+    allowed_motif_kinds = tuple(role.motif_kind for role in profile.binary_bridge_roles)
+    resolver = MonomerRoleResolver.builtin()
+
+    first_kind = _resolve_single_pair_motif_kind(
+        smiles=args.first_smiles,
+        explicit_kind=args.first_motif_kind,
+        monomer_id=args.first_id,
+        allowed_motif_kinds=allowed_motif_kinds,
+        auto_detect=args.auto_detect_motifs,
+        resolver=resolver,
+        num_conformers=args.num_conformers,
+    )
+    second_kind = _resolve_single_pair_motif_kind(
+        smiles=args.second_smiles,
+        explicit_kind=args.second_motif_kind,
+        monomer_id=args.second_id,
+        allowed_motif_kinds=allowed_motif_kinds,
+        auto_detect=args.auto_detect_motifs,
+        resolver=resolver,
+        num_conformers=args.num_conformers,
+    )
+
+    first = build_rdkit_monomer(
+        args.first_id,
+        args.first_name or args.first_id,
+        args.first_smiles,
+        first_kind,
+        num_conformers=args.num_conformers,
+    )
+    second = build_rdkit_monomer(
+        args.second_id,
+        args.second_name or args.second_id,
+        args.second_smiles,
+        second_kind,
+        num_conformers=args.num_conformers,
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    generator = _configure_generator(args, template_id=args.template_id)
+    if args.all_topologies:
+        summaries, candidates, attempted_structures = generator.generate_monomer_pair_candidates(
+            first,
+            second,
+            pair_id=f"{args.first_id}__{args.second_id}",
+            out_dir=output_dir / "cifs",
+            write_cif=args.write_cif,
+            cif_export_start_index=0,
+        )
+    else:
+        summary, candidate = generator.generate_monomer_pair_candidate(
+            first,
+            second,
+            pair_id=f"{args.first_id}__{args.second_id}",
+            out_dir=output_dir / "cifs",
+            write_cif=args.write_cif,
+            cif_export_index=0,
+        )
+        summaries = (summary,)
+        candidates = () if candidate is None else (candidate,)
+        attempted_structures = 1 if summary.status == "ok" else 0
+
+    report = {
+        **({"requested_cofid": requested_cofid} if requested_cofid is not None else {}),
+        "template_id": args.template_id,
+        "target_dimensionality": args.target_dimensionality,
+        "first": {
+            "id": args.first_id,
+            "name": args.first_name or args.first_id,
+            "motif_kind": first_kind,
+            "motif_count": len(first.motifs),
+            "geometry": _monomer_geometry_summary(first),
+        },
+        "second": {
+            "id": args.second_id,
+            "name": args.second_name or args.second_id,
+            "motif_kind": second_kind,
+            "motif_count": len(second.motifs),
+            "geometry": _monomer_geometry_summary(second),
+        },
+        "attempted_structures": attempted_structures,
+        "successful_structures": sum(1 for summary in summaries if summary.status == "ok"),
+        "cifs_written": sum(1 for summary in summaries if summary.cif_path is not None),
+        "results": [_summary_to_single_pair_result(summary) for summary in summaries],
+    }
+    (output_dir / "summary.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    print("template_id:", args.template_id)
+    if requested_cofid is not None:
+        print("requested_cofid:", requested_cofid)
+    print("target_dimensionality:", args.target_dimensionality)
+    print("first_monomer:", args.first_id, first_kind, len(first.motifs))
+    print("second_monomer:", args.second_id, second_kind, len(second.motifs))
+    print("attempted_structures:", attempted_structures)
+    print("successful_structures:", report["successful_structures"])
+    print("cifs_written:", report["cifs_written"])
+    print("summary:", output_dir / "summary.json")
+    for summary in summaries:
+        print(
+            "result:",
+            summary.structure_id,
+            summary.status,
+            summary.topology_id or "none",
+            f"{summary.score:.6f}" if summary.score is not None else "n/a",
+            summary.cif_path or "-",
+        )
+        _print_single_pair_geometry_repair_warning(summary)
+
+
+def _add_ring_forming_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "ring-forming",
+        help="Build a COF from a ditopic precursor by three-body ring formation.",
+        description="Build boroxine- or triazine-linked 2D COFs using virtual 3-connected product nodes.",
+    )
+    parser.add_argument("--cofid", default=None, help="One-precursor ring-forming COFid to build.")
+    parser.add_argument(
+        "--template-id",
+        choices=("boroxine_trimerization", "triazine_trimerization"),
+        default="boroxine_trimerization",
+    )
+    parser.add_argument("--smiles", default=None, help="SMILES for the ditopic precursor.")
+    parser.add_argument("--monomer-id", default="ring_precursor")
+    parser.add_argument("--monomer-name", default=None)
+    parser.add_argument("--motif-kind", choices=("boronic_acid", "nitrile"), default=None)
+    parser.add_argument("--topology", default="hcb", help="Three-connected product topology. Default: hcb.")
+    parser.add_argument("--num-conformers", type=int, default=4)
+    parser.add_argument("--layer-spacing", type=float, default=3.4)
+    parser.add_argument(
+        "--stacking",
+        action="append",
+        default=[],
+        help="Enumerate a named 2D bilayer registry (AA, AB, or slipped). Repeat for multiple variants.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=_default_repo_path("out", "ring_forming_generation"),
+    )
+    parser.add_argument(
+        "--write-cif",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Write the atomistic product CIF. Enabled by default.",
+    )
+    parser.add_argument(
+        "--legacy-scoring",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Attach the deprecated heuristic score (20 - ring residual) to outputs. "
+            "Disabled by default: outputs carry score=null."
+        ),
+    )
+    parser.set_defaults(func=_run_ring_forming)
+
+
+def _run_ring_forming(args: argparse.Namespace) -> None:
+    if args.cofid is not None and any(
+        value is not None for value in (args.smiles, args.motif_kind)
+    ):
+        raise SystemExit("--cofid cannot be combined with --smiles or --motif-kind")
+
+    requested_cofid = None
+    if args.cofid is not None:
+        request = cofid_to_build_request(args.cofid)
+        profile = ReactionLibrary.builtin().linkage_profile(request.template_id)
+        if profile is None or not profile.supports_ring_forming_generation:
+            raise SystemExit(f"COFid linkage {request.linkage_code!r} is not a ring-forming workflow")
+        requested_cofid = request.cofid
+        args = argparse.Namespace(**vars(args))
+        args.template_id = request.template_id
+        args.smiles = request.monomers[0].canonical_smiles
+        args.motif_kind = request.monomers[0].motif_kind
+        args.topology = request.topology
+        if args.monomer_id == "ring_precursor":
+            args.monomer_id = "cofid_m1"
+    elif args.smiles is None:
+        raise SystemExit("ring-forming requires either --cofid or --smiles")
+
+    library = ReactionLibrary.builtin()
+    profile = library.linkage_profile(args.template_id)
+    if profile is None or not profile.supports_ring_forming_generation:
+        raise SystemExit(f"template {args.template_id!r} does not support ring-forming generation")
+    motif_kind = args.motif_kind or profile.ring_participant_motif_kind
+    if motif_kind != profile.ring_participant_motif_kind:
+        raise SystemExit(
+            f"template {args.template_id!r} requires motif kind {profile.ring_participant_motif_kind!r}"
+        )
+    monomer = build_rdkit_monomer(
+        args.monomer_id,
+        args.monomer_name or args.monomer_id,
+        args.smiles,
+        motif_kind,
+        num_conformers=args.num_conformers,
+    )
+    generator = RingFormingStructureGenerator(
+        config=RingFormationConfig(
+            topology_id=args.topology,
+            layer_spacing=args.layer_spacing,
+            optimize_geometry=True,
+            stacking_ids=tuple(args.stacking),
+            enable_legacy_scoring=getattr(args, "legacy_scoring", False),
+        ),
+        reaction_library=library,
+    )
+    candidates = generator.generate_candidates(monomer, args.template_id)
+    generated_cofid = try_generate_cofid(candidates[0], {monomer.id: monomer})
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    result_rows: list[dict[str, object]] = []
+    for candidate in candidates:
+        candidate_cofid = try_generate_cofid(candidate, {monomer.id: monomer})
+        cif_path = None
+        export = None
+        if args.write_cif:
+            cif_path = output_dir / f"{candidate.id}.cif"
+            stacking = candidate.metadata.get("stacking")
+            comment_suffix = (
+                str(stacking.get("comment_suffix"))
+                if isinstance(stacking, dict) and stacking.get("comment_suffix") is not None
+                else None
+            )
+            export = CIFWriter().write_candidate(
+                cif_path,
+                candidate,
+                {monomer.id: monomer},
+                cofid=candidate_cofid,
+                cofid_comment_suffix=comment_suffix,
+            )
+        result_rows.append(
+            {
+                "status": "ok",
+                "candidate_id": candidate.id,
+                "generated_cofid": candidate_cofid,
+                "score": candidate.score,
+                "flags": list(candidate.flags),
+                "graph_summary": candidate.metadata["graph_summary"],
+                "ring_validation": candidate.metadata["ring_validation"],
+                "optimization": candidate.metadata["optimization"],
+                "stacking": candidate.metadata.get("stacking"),
+                "cell": candidate.state.cell,
+                "cif_path": None if cif_path is None else str(cif_path),
+                "cif_sites": None if export is None else export.n_sites,
+                "reaction_realization": None if export is None else export.metadata.get("reaction_realization"),
+                "reaction_realization_status": (
+                    "not_requested"
+                    if export is None
+                    else "completed"
+                    if export.metadata.get("reaction_realization") is not None
+                    else "unavailable"
+                ),
+            }
+        )
+    first_result = result_rows[0]
+    report = {
+        **({"requested_cofid": requested_cofid} if requested_cofid is not None else {}),
+        "generated_cofid": generated_cofid,
+        "template_id": args.template_id,
+        "topology_id": args.topology,
+        "stacking_requested": list(args.stacking),
+        "attempted_structures": len(result_rows),
+        "successful_structures": sum(1 for row in result_rows if row["status"] == "ok"),
+        "cifs_written": sum(1 for row in result_rows if row["cif_path"] is not None),
+        "precursor": {
+            "id": monomer.id,
+            "motif_kind": motif_kind,
+            "motif_count": len(monomer.motifs),
+            "geometry": _monomer_geometry_summary(monomer),
+        },
+        **first_result,
+        "results": result_rows,
+    }
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print("template_id:", args.template_id)
+    print("topology_id:", args.topology)
+    print("precursor:", monomer.id, motif_kind, len(monomer.motifs))
+    print("variants:", len(candidates))
+    print("generated_cofid:", generated_cofid or "-")
+    for row in result_rows:
+        print(
+            "result:",
+            row["candidate_id"],
+            (row["stacking"] or {}).get("id", "unstacked") if isinstance(row["stacking"], dict) else "unstacked",
+            row["ring_validation"]["classification"],
+            row["cif_path"] or "-",
+        )
+    print("summary:", summary_path)
+
+
+def _resolve_single_pair_motif_kind(
+    *,
+    smiles: str,
+    explicit_kind: str | None,
+    monomer_id: str,
+    allowed_motif_kinds: Iterable[str],
+    auto_detect: bool,
+    resolver: MonomerRoleResolver,
+    num_conformers: int,
+) -> str:
+    if explicit_kind is not None:
+        return explicit_kind
+    if not auto_detect:
+        raise SystemExit(f"monomer {monomer_id!r} needs an explicit motif kind or --auto-detect-motifs")
+    record = resolver.infer_record(
+        smiles,
+        record_id=monomer_id,
+        allowed_motif_kinds=allowed_motif_kinds,
+        num_conformers=num_conformers,
+    )
+    return record.motif_kind
+
+
+def _monomer_geometry_summary(monomer) -> dict[str, object]:
+    metadata = monomer.metadata
+    return {
+        "mode": metadata.get("geometry_mode"),
+        "embedding_method": metadata.get("embedding_method"),
+        "fallback": bool(metadata.get("embedding_fallback", False)),
+        "attempts": metadata.get("embedding_attempts", ()),
+        "forcefield": metadata.get("forcefield"),
+        "forcefield_optimization_status": metadata.get("forcefield_optimization_status"),
+    }
+
+
+def _summary_to_single_pair_result(summary) -> dict[str, object]:
+    return {
+        "structure_id": summary.structure_id,
+        "pair_id": summary.pair_id,
+        "pair_mode": summary.pair_mode,
+        "status": summary.status,
+        "reactant_record_ids": dict(summary.reactant_record_ids),
+        "reactant_connectivities": dict(summary.reactant_connectivities),
+        "topology_id": summary.topology_id,
+        "score": summary.score,
+        "flags": list(summary.flags),
+        "cif_path": summary.cif_path,
+        "metadata": summary.metadata,
+    }
+
+
+def _print_single_pair_geometry_repair_warning(summary) -> None:
+    validation = summary.metadata.get("validation")
+    if not isinstance(validation, dict):
+        return
+    repair = validation.get("geometry_repair")
+    if not isinstance(repair, dict):
+        return
+    if repair.get("status") == "failed":
+        print(
+            "WARNING:",
+            f"geometry repair failed for {summary.structure_id}:",
+            repair.get("error", "unknown error"),
+        )
+        return
+    post_repair = repair.get("post_repair_validation")
+    if isinstance(post_repair, dict) and post_repair.get("classification") != "valid":
+        print(
+            "WARNING:",
+            f"geometry repair completed for {summary.structure_id}, but repaired CIF validation classified it as",
+            post_repair.get("classification", "unknown"),
+        )
+
+
+def _print_batch_summary(summary, *, template_id: str | None = None) -> None:
+    if template_id is not None:
+        print("template_id:", template_id)
+    print("input_dir:", summary.input_dir)
+    print("output_dir:", summary.output_dir)
+    print("attempted_pairs:", summary.attempted_pairs)
+    print("successful_pairs:", summary.successful_pairs)
+    print("attempted_structures:", summary.attempted_structures)
+    print("successful_structures:", summary.successful_structures)
+    print("built_monomers:", summary.built_monomers)
+    print("failed_monomers:", summary.failed_monomers)
+    print("mode_counts:", dict(summary.mode_counts))
+    print("topology_counts:", dict(summary.topology_counts))
+    print("geometry_repair_counts:", dict(summary.geometry_repair_counts))
+    print("geometry_repair_revalidation_counts:", dict(summary.geometry_repair_revalidation_counts))
+    print("geometry_repair_failed_records:", summary.geometry_repair_failed_records_path or "-")
+    print("cifs_written:", summary.cifs_written)
+    print("manifest:", summary.manifest_path)
+    failed_repairs = int(summary.geometry_repair_counts.get("failed", 0))
+    if failed_repairs > 0:
+        print(
+            "WARNING:",
+            f"geometry repair failed for {failed_repairs} structure(s); failed records:",
+            summary.geometry_repair_failed_records_path,
+        )
+    nonvalid_repaired = sum(
+        int(count)
+        for classification, count in summary.geometry_repair_revalidation_counts.items()
+        if classification != "valid"
+    )
+    if nonvalid_repaired > 0:
+        print(
+            "WARNING:",
+            f"geometry repair completed for {nonvalid_repaired} structure(s) whose repaired CIF validation was not valid.",
+        )
+    for result in summary.top_results[:10]:
+        print(
+            "top_result:",
+            result.structure_id,
+            result.pair_mode,
+            f"{result.score:.6f}" if result.score is not None else "n/a",
+            result.topology_id or "none",
+            dict(result.reactant_record_ids),
+        )
+
+
+def _add_batch_binary_bridge_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "batch-binary-bridge",
+        help="Run batch generation for one binary-bridge template.",
+        description="Run batch binary-bridge COF generation over monomer libraries.",
+    )
+    parser.add_argument("--template-id", default="imine_bridge", help="Binary bridge template to use.")
+    parser.set_defaults(func=_run_batch_binary_bridge)
+    _add_common_batch_generation_arguments(parser)
+    parser.set_defaults(
+        input_dir=_default_repo_path("examples", "batch_test_monomers"),
+        output_dir=_default_repo_path("out", "binary_bridge_generation"),
+    )
+
+
+def _run_batch_binary_bridge(args: argparse.Namespace) -> None:
+    if not Path(args.input_dir).is_dir():
+        raise SystemExit(f"input directory does not exist: {args.input_dir}")
+    generator = _configure_generator(args, template_id=args.template_id)
+    summary = generator.run_binary_bridge_batch(
+        args.input_dir,
+        args.output_dir,
+        template_id=args.template_id,
+        max_pairs=args.max_pairs,
+        write_cif=args.write_cif,
+        auto_detect_libraries=args.auto_detect_libraries,
+    )
+    _print_batch_summary(summary, template_id=args.template_id)
+
+
+def _add_batch_all_binary_bridges_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "batch-all-binary-bridges",
+        help="Run all currently available binary-bridge templates over one library directory.",
+        description="Run all currently available binary-bridge batch generators over one monomer-library directory.",
+    )
+    _add_common_batch_generation_arguments(parser)
+    parser.add_argument(
+        "--template-workers",
+        type=int,
+        default=1,
+        help="How many linkage-template batches to run concurrently. Defaults to 1.",
+    )
+    parser.set_defaults(
+        func=_run_batch_all_binary_bridges,
+        input_dir=_default_repo_path("examples", "default_monomers_library"),
+        output_dir=_default_repo_path("out", "available_binary_bridge_batches"),
+        num_conformers=2,
+    )
+
+
+def _run_batch_all_binary_bridges(args: argparse.Namespace) -> None:
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    if not input_dir.is_dir():
+        raise SystemExit(f"input directory does not exist: {input_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    discovery = BatchStructureGenerator(BatchGenerationConfig(max_workers=max(1, args.max_workers)))
+    available_templates = discovery.available_binary_bridge_template_ids(
+        input_dir,
+        auto_detect_libraries=args.auto_detect_libraries,
+    )
+    if not available_templates:
+        raise SystemExit("no available binary-bridge templates were detected for the input directory")
+
+    template_workers = min(max(1, args.template_workers), len(available_templates))
+    summaries = {}
+    with ThreadPoolExecutor(max_workers=template_workers) as executor:
+        futures = {
+            executor.submit(_run_template_batch, template_id, args, input_dir, output_dir): template_id
+            for template_id in available_templates
+        }
+        for future in as_completed(futures):
+            template_id, summary = future.result()
+            summaries[template_id] = summary
+
+    combined_summary = {
+        "available_templates": available_templates,
+        "template_workers": template_workers,
+        "template_summaries": {template_id: _summary_to_json(summary) for template_id, summary in summaries.items()},
+    }
+    (output_dir / "combined_summary.json").write_text(json.dumps(combined_summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print("input_dir:", input_dir)
+    print("output_dir:", output_dir)
+    print("available_templates:", available_templates)
+    print("template_workers:", template_workers)
+    for template_id in available_templates:
+        _print_batch_summary(summaries[template_id], template_id=template_id)
+
+
+def _run_template_batch(
+    template_id: str,
+    args: argparse.Namespace,
+    input_dir: Path,
+    output_dir: Path,
+):
+    generator = _configure_generator(args, template_id=template_id)
+    summary = generator.run_binary_bridge_batch(
+        input_dir,
+        output_dir / template_id,
+        template_id=template_id,
+        max_pairs=args.max_pairs,
+        write_cif=args.write_cif,
+        auto_detect_libraries=args.auto_detect_libraries,
+    )
+    return template_id, summary
+
+
+def _summary_to_json(summary) -> dict[str, object]:
+    return {
+        "input_dir": summary.input_dir,
+        "output_dir": summary.output_dir,
+        "attempted_pairs": summary.attempted_pairs,
+        "successful_pairs": summary.successful_pairs,
+        "attempted_structures": summary.attempted_structures,
+        "successful_structures": summary.successful_structures,
+        "cifs_written": summary.cifs_written,
+        "built_monomers": summary.built_monomers,
+        "failed_monomers": summary.failed_monomers,
+        "build_failures": dict(summary.build_failures),
+        "mode_counts": dict(summary.mode_counts),
+        "topology_counts": dict(summary.topology_counts),
+        "geometry_repair_counts": dict(summary.geometry_repair_counts),
+        "geometry_repair_revalidation_counts": dict(summary.geometry_repair_revalidation_counts),
+        "geometry_repair_failed_records_path": summary.geometry_repair_failed_records_path,
+        "manifest_path": summary.manifest_path,
+    }
+
+
+def _add_default_library_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "default-library",
+        help="Build a detector-scanned default monomer library from source SMILES files.",
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=_default_repo_path("examples", "batch_test_monomers"),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=_default_repo_path("examples", "default_monomers_library"),
+    )
+    parser.add_argument("--num-conformers", type=int, default=2)
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow replacing a non-empty output directory that was not created by this command.",
+    )
+    parser.set_defaults(func=_run_default_library)
+
+
+_DEFAULT_LIBRARY_MARKER = ".cofkit-default-library"
+
+
+def _prepare_default_library_output_dir(output_dir: Path, *, force: bool) -> None:
+    """Reset the default-library output directory without deleting foreign data.
+
+    The directory is only removed when it is empty, was created by a previous
+    run of this command (marker file present), or the user explicitly passed
+    ``--force``.
+    """
+    if output_dir.exists() and not output_dir.is_dir():
+        raise SystemExit(f"output path exists and is not a directory: {output_dir}")
+    if output_dir.is_dir():
+        has_contents = any(output_dir.iterdir())
+        has_marker = (output_dir / _DEFAULT_LIBRARY_MARKER).is_file()
+        if has_contents and not has_marker and not force:
+            raise SystemExit(
+                "refusing to delete a non-empty directory that was not created by "
+                f"`cofkit build default-library`: {output_dir}\n"
+                "pass --force to replace it anyway"
+            )
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _run_default_library(args: argparse.Namespace) -> None:
+    input_dir = Path(args.input_dir)
+    output_dir = Path(args.output_dir)
+    if not input_dir.is_dir():
+        raise SystemExit(f"input directory does not exist: {input_dir}")
+    _prepare_default_library_output_dir(output_dir, force=args.force)
+
+    generator = BatchStructureGenerator(BatchGenerationConfig(rdkit_num_conformers=args.num_conformers))
+    registered_records: list[dict[str, object]] = []
+    failed_records: list[dict[str, object]] = []
+    grouped_smiles: dict[str, list[str]] = {}
+    grouped_entries: dict[str, list[dict[str, object]]] = {}
+
+    for path in sorted(input_dir.glob("*.txt")):
+        declared_connectivity = _source_declared_connectivity(path)
+        declared_motif_kind = _source_declared_motif_kind(path, generator.reaction_library)
+        seen = 0
+        with path.open(encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line_number == 1 and line.lower() == "smiles":
+                    continue
+                seen += 1
+                source_record_id = f"{path.stem}_{seen:04d}"
+                base_row = {
+                    "source_file": path.name,
+                    "source_line": line_number,
+                    "source_record_id": source_record_id,
+                    "source_declared_motif_kind": declared_motif_kind,
+                    "source_declared_connectivity": declared_connectivity,
+                    "smiles": line,
+                }
+                try:
+                    record = generator.infer_monomer_record(
+                        line,
+                        record_id=source_record_id,
+                        source_path=str(path),
+                        source_line=line_number,
+                        library_stem=path.stem,
+                    )
+                except Exception as exc:
+                    failed_records.append({**base_row, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
+                    continue
+
+                library_key = f"{generator._library_prefix_for_motif_kind(record.motif_kind)}_count_{record.expected_connectivity}"
+                grouped_smiles.setdefault(library_key, []).append(record.smiles)
+                entry = {
+                    **base_row,
+                    "status": "registered",
+                    "detected_motif_kind": record.motif_kind,
+                    "detected_connectivity": record.expected_connectivity,
+                    "detected_motif_kinds": list(record.metadata.get("detected_motif_kinds", ())),
+                    "detected_connectivities": dict(record.metadata.get("detected_connectivities", {})),
+                    "library_key": library_key,
+                    "source_role_match": declared_motif_kind == record.motif_kind if declared_motif_kind is not None else None,
+                    "source_connectivity_match": declared_connectivity == record.expected_connectivity if declared_connectivity is not None else None,
+                }
+                grouped_entries.setdefault(library_key, []).append(entry)
+                registered_records.append(entry)
+
+    for library_key, smiles_rows in sorted(grouped_smiles.items()):
+        path = output_dir / f"{library_key}.txt"
+        path.write_text("smiles\n" + "\n".join(smiles_rows) + "\n", encoding="utf-8")
+
+    registry_rows: list[dict[str, object]] = []
+    for library_key, entries in sorted(grouped_entries.items()):
+        for index, entry in enumerate(entries, start=1):
+            registry_rows.append(
+                {
+                    **entry,
+                    "registered_record_id": f"{library_key}_{index:04d}",
+                    "registered_library_path": f"{library_key}.txt",
+                }
+            )
+
+    _jsonl_write(output_dir / "registry.jsonl", registry_rows)
+    _jsonl_write(output_dir / "failures.jsonl", failed_records)
+
+    library_counts = Counter(entry["library_key"] for entry in registered_records)
+    mismatch_count = sum(
+        1
+        for entry in registered_records
+        if entry["source_role_match"] is False or entry["source_connectivity_match"] is False
+    )
+    summary_lines = [
+        "# Default Monomers Library",
+        "",
+        "This directory is auto-generated using the current monomer role detector.",
+        "",
+        f"- source_dir: `{input_dir}`",
+        f"- registered monomers: {len(registered_records)}",
+        f"- failed or ambiguous detections: {len(failed_records)}",
+        f"- source-label mismatches among registered monomers: {mismatch_count}",
+        "",
+        "## Registered Libraries",
+        "",
+    ]
+    for library_key, count in sorted(library_counts.items()):
+        summary_lines.append(f"- `{library_key}.txt`: {count}")
+    summary_lines.extend(
+        (
+            "",
+            "## Metadata Files",
+            "",
+            "- `registry.jsonl`: registered monomers with detector metadata and source provenance",
+            "- `failures.jsonl`: failed or ambiguous autodetections",
+        )
+    )
+    (output_dir / "README.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+    (output_dir / _DEFAULT_LIBRARY_MARKER).write_text(
+        "generated by `cofkit build default-library`; safe to regenerate\n",
+        encoding="utf-8",
+    )
+
+    print("output_dir:", output_dir)
+    print("registered_monomers:", len(registered_records))
+    print("failed_monomers:", len(failed_records))
+    print("libraries:", dict(sorted(library_counts.items())))
+
+
+def _jsonl_write(path: Path, rows: Iterable[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _source_declared_connectivity(path: Path) -> int | None:
+    stem = path.stem
+    if "_count_" not in stem:
+        return None
+    try:
+        return int(stem.rsplit("_", 1)[1])
+    except ValueError:
+        return None
+
+
+def _source_declared_motif_kind(path: Path, reaction_library: ReactionLibrary) -> str | None:
+    stem = path.stem
+    if "_count_" not in stem:
+        return None
+    prefix = stem.split("_count_", 1)[0]
+    for profile in reaction_library.linkage_profiles.values():
+        for role in profile.binary_bridge_roles:
+            library_prefix = role.library_prefix or f"{role.motif_kind}s"
+            if library_prefix == prefix:
+                return role.motif_kind
+    if prefix.endswith("s"):
+        return prefix[:-1]
+    return prefix
+
+
+def _add_list_templates_parser(subparsers) -> None:
+    parser = subparsers.add_parser(
+        "list-templates",
+        help="List registered reaction templates and their execution capabilities.",
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
+    parser.set_defaults(func=_run_list_templates)
+
+
+def _run_list_templates(args: argparse.Namespace) -> None:
+    library = ReactionLibrary.builtin()
+    rows = []
+    for template_id, template in sorted(library.templates.items()):
+        profile = library.linkage_profile(template_id)
+        rows.append(
+            {
+                "template_id": template_id,
+                "arity": template.arity,
+                "reactant_motif_kinds": template.reactant_motif_kinds,
+                "workflow_family": None if profile is None else profile.workflow_family,
+                "supports_pair_generation": False if profile is None else profile.supports_binary_bridge_pair_generation,
+                "supports_ring_generation": False if profile is None else profile.supports_ring_forming_generation,
+                "supports_atomistic_realization": False if profile is None else profile.supports_atomistic_realization,
+                "supports_topology_guided_generation": False if profile is None else profile.supports_topology_guided_generation,
+                "topology_assignment_mode": None if profile is None else profile.topology_assignment_mode,
+                "roles": () if profile is None else tuple(role.motif_kind for role in profile.binary_bridge_roles),
+            }
+        )
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return
+    for row in rows:
+        print(
+            row["template_id"],
+            "arity=" + str(row["arity"]),
+            "family=" + str(row["workflow_family"]),
+            "pair_generation=" + str(row["supports_pair_generation"]).lower(),
+            "ring_generation=" + str(row["supports_ring_generation"]).lower(),
+            "atomistic=" + str(row["supports_atomistic_realization"]).lower(),
+            "topology_guided=" + str(row["supports_topology_guided_generation"]).lower(),
+            "roles=" + ",".join(row["roles"]),
+        )

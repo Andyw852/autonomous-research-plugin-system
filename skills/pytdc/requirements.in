@@ -1,0 +1,6 @@
+PyTDC==1.1.14
+setuptools==80.9.0
+# PyTDC 1.1.14 requires scikit-learn==1.2.2 exactly; this is also the newest
+# scikit-learn that can load the GSK3B/JNK3 checkpoints (pickled with sklearn 0.23,
+# whose tree node dtype changed in sklearn >= 1.3). Pinned explicitly to prevent drift.
+scikit-learn==1.2.2

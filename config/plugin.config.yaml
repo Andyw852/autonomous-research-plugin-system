@@ -1,0 +1,39 @@
+# Plugin configuration. This is self-contained and harness-agnostic.
+config_version: "0.1.0"
+
+# Paths are resolved relative to the plugin root unless absolute.
+plugin:
+  name: autonomous-research-engine
+  version: "0.1.0"
+  agents_dir: agents
+  blackboard_scripts_dir: scripts/engine/blackboard_core
+
+# Default run root for `research init`. Can be overridden by CLI --run-root.
+run_root: runs
+
+# Subagent creation is performed by the main agent, not by the engine.
+# `fake` is only for tests/automation.
+subagent_backend:
+  default: auto
+
+engine:
+  language: en
+  max_outer_rounds: 10
+  propose_count: 1
+  network_policy: deny
+  auto_rebuild: after_each_event
+
+director:
+  # A lower bound only; never a sufficiency criterion for scientific closure.
+  min_outer_rounds: 2
+  # strict requires law-level maturity before scientific_closure.
+  closure_mode: strict
+  require_boundary_extension_resolution: true
+
+mission:
+  max_inner_rounds: 3
+  min_hypotheses: 1
+  max_hypotheses: 5
+
+trace:
+  enabled: true
